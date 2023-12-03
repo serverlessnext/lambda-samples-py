@@ -1,0 +1,118 @@
+
+LAMBDA_RUNTIME := python3.11
+LAMBDA_MEMORY_MB := 256
+LAMBDA_TIMEOUT_SEC := 30
+
+## Function to check if variables are defined
+check_defined = \
+	$(strip $(foreach 1,$1, \
+    	$(call __check_defined,$1,$(strip $(value 2)))))
+__check_defined = \
+	$(if $(value $1),, \
+		$(error Undefined $1$(if $2, ($2))))
+
+
+# lazy evaluated -- loaded when needed 
+AWS_ACCOUNT_ID = $(shell aws sts get-caller-identity --query Account --output text)
+POLICY_ARN = arn:aws:iam::$(AWS_ACCOUNT_ID):policy/$(POLICY_NAME)
+LAMBDA_ZIP = build/$(FUNCTION_NAME).zip
+ROLE_NAME = lambda-$(FUNCTION_NAME)
+POLICY_NAME = permissions-$(FUNCTION_NAME)
+
+.PHONY: lambda_deploy_with_role
+lambda_deploy_with_role:
+	@:$(call check_defined, AWS_REGION, AWS region)
+	@:$(call check_defined, APP_BASE_DIRECTORY, Application base directory)
+	@:$(call check_defined, FUNCTION_NAME, Lambda function name)
+	@:$(call check_defined, LOGLEVEL, Log level)
+	@# Create IAM Role
+	@if ! aws iam get-role --role-name $(ROLE_NAME) >/dev/null 2>&1; then \
+		echo "Creating role $(ROLE_NAME)"; \
+		aws iam create-role \
+			--role-name $(ROLE_NAME) \
+			--assume-role-policy-document file://files/lambda-trust-policy.json \
+			>/dev/null; \
+	fi
+	@# Put role policy
+	@aws iam put-role-policy \
+		--role-name $(ROLE_NAME) \
+		--policy-name $(POLICY_NAME) \
+		--policy-document file://lambdas/$(APP_BASE_DIRECTORY)/role_policy.json \
+		>/dev/null
+	@sleep 5	# wait for IAM Role to be ready
+	@# Create or update Lambda Function
+	@if ! aws lambda get-function --region $(AWS_REGION) --function-name $(FUNCTION_NAME) >/dev/null 2>&1; then \
+		echo "Creating lambda function $(FUNCTION_NAME)"; \
+		aws lambda create-function \
+			--region $(AWS_REGION) \
+			--function-name $(FUNCTION_NAME) \
+			--role arn:aws:iam::$(AWS_ACCOUNT_ID):role/$(ROLE_NAME) \
+			--runtime $(LAMBDA_RUNTIME) \
+			--memory-size $(LAMBDA_MEMORY_MB) \
+			--timeout $(LAMBDA_TIMEOUT_SEC) \
+			--handler app.main.handler \
+			--zip-file fileb://$(LAMBDA_ZIP) \
+			>/dev/null; \
+	else \
+		echo "Updating lambda function $(FUNCTION_NAME)"; \
+		aws lambda update-function-code \
+			--region $(AWS_REGION) \
+			--function-name $(FUNCTION_NAME) \
+			--zip-file fileb://$(LAMBDA_ZIP) \
+			>/dev/null; \
+	fi
+
+.PHONY: lambda_delete_with_role
+lambda_delete_with_role:
+	@:$(call check_defined, AWS_REGION, AWS region)
+	@:$(call check_defined, FUNCTION_NAME, Application name)
+	@# Delete Lambda Function
+	@if aws lambda get-function --region $(AWS_REGION) --function-name $(FUNCTION_NAME) >/dev/null 2>&1; then \
+	    echo "Deleting lambda function $(FUNCTION_NAME)"; \
+		aws lambda delete-function \
+			--region $(AWS_REGION) \
+			--function-name $(FUNCTION_NAME); \
+	fi
+	@# Delete IAM Role Policy 
+	@if aws iam get-role-policy --role-name $(ROLE_NAME) --policy-name $(POLICY_NAME) >/dev/null 2>&1; then \
+	    echo "Deleting role policy $(POLICY_NAME)"; \
+	    aws iam delete-role-policy \
+	        --role-name $(ROLE_NAME) \
+	        --policy-name $(POLICY_NAME); \
+	fi
+	@# Delete IAM Role
+	@if aws iam get-role --role-name $(ROLE_NAME) >/dev/null 2>&1; then \
+	    echo "Deleting role $(ROLE_NAME)"; \
+	    aws iam delete-role \
+	        --role-name $(ROLE_NAME); \
+	fi
+
+# while deploy also update lambda, if certain lambda exists
+# this will be much faster
+.PHONY: lambda_patch
+lambda_patch:
+	@:$(call check_defined, AWS_REGION, AWS region)
+	@:$(call check_defined, FUNCTION_NAME, Application name)
+	@echo "Updating lambda function $(FUNCTION_NAME)"
+	@aws lambda update-function-code \
+		--region $(AWS_REGION) \
+		--function-name $(FUNCTION_NAME) \
+		--zip-file fileb://$(LAMBDA_ZIP) \
+		>/dev/null
+
+.PHONY: lambda_invoke
+lambda_invoke:
+	@:$(call check_defined, AWS_REGION, AWS region)
+	@:$(call check_defined, FUNCTION_NAME, Application name)
+	@:$(call check_defined, LAMBDA_PAYLOAD, Lambda payload)
+	@[ -d tmp ] || mkdir tmp
+	@echo "Invoking with payload: '$(LAMBDA_PAYLOAD)'"
+	aws lambda invoke \
+		--region $(AWS_REGION) \
+		--cli-binary-format raw-in-base64-out \
+		--function-name $(FUNCTION_NAME) \
+		--invocation-type RequestResponse \
+		--payload '$(LAMBDA_PAYLOAD)' tmp/lambda-out
+	@echo "Response:"
+	@cat tmp/lambda-out
+	@echo	# newline
